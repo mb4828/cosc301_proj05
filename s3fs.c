@@ -35,7 +35,7 @@ s3dirent_t *expandarray(s3dirent_t *old) {
 	int i=0;
 	for (; i<size; i++) {
 		new[i].type = old[i].type;
-		strncpy(new[i].name, old[i].name, 255);
+		strncpy(new[i].name, old[i].name, 256);
 
 		new[i].mode = old[i].mode;
 		new[i].nlink = old[i].nlink;
@@ -96,7 +96,7 @@ void *fs_init(struct fuse_conn_info *conn)
 	// zero out remaining root object names
 	int i=1;
 	for (; i<8; i++) {
-		strncpy(&root[i].name, "\0", 255);
+		strncpy(root[i].name, "\0", 255);
 	}
 	
 	// store root array
@@ -381,7 +381,7 @@ int fs_mkdir(const char *path, mode_t mode) {
 	// zero out remaining array object names
 	int i=2;
 	for (; i<8; i++) {
-		strncpy(&temp[i].name, "\0", 255);
+		strncpy(temp[i].name, "\0", 255);
 	}
 
 	
@@ -396,10 +396,14 @@ int fs_mkdir(const char *path, mode_t mode) {
 	if ( i >= size ) {
 		// need to expand the parent array to make room
 		dir = expandarray(dir);
+		for (i=size; i<(size*2); i++) {
+			strncpy(dir[i].name, "\0", 255);
+		}
 	}
 
 	dir[i].type = 'd';
 	strncpy(dir[i].name, basename((char*)path), 255);
+	strcat(dir[i].name, "\0");
 
 	// replace parent directory on s3
 	fprintf(stderr, "  adding new directory and updated parent to s3\n");
@@ -548,7 +552,101 @@ int fs_rmdir(const char *path) {
 int fs_mknod(const char *path, mode_t mode, dev_t dev) {
     fprintf(stderr, "fs_mknod(path=\"%s\", mode=0%3o)\n", path, mode);
     s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+	mode |= S_IFREG;
+
+	if (path==NULL) {
+		fprintf(stderr, "  no path name provided; aborting\n");
+		return -ENOENT;
+	}
+
+	// break up path into key and basename
+	const char *key = dirname((char*)path);
+	const char *name = basename((char*)path);
+
+	if ( strcmp(key, ".")==0 ) {
+		fprintf(stderr, "  relative key name not supported by fs_getattr: %s\n", key);
+		return -EIO;
+	}
+
+	// open parent directory
+	fprintf(stderr, "  retrieving parent directory from s3\n");
+	char *s3bucket = getenv(S3BUCKET);
+	s3dirent_t *dir;
+	ssize_t rv = s3fs_get_object(s3bucket, key, (uint8_t**)&dir, 0, 0);
+    if (rv < 0) {
+       	fprintf(stderr, "  cannot open parent directory: %s\n", key );
+		return -ENOENT;
+    } else if (rv != sizeof(dir)) {
+       	fprintf(stderr, "  failed to retrieve entire parent (s3fs_get_object %ld)\n", rv);
+		return -ENOENT;
+    } else {
+		fprintf(stderr, "  got parent from s3\n");
+	}
+
+	// does filename already exist?
+	int dirsize = sizeof(dir)/sizeof(s3dirent_t);
+	int i=0;
+	int freent=0;	// for efficiency, locating free entry while we check for already exist
+	int done=0;
+	for (; i<dirsize; i++) {
+		if (!done) {		
+			if (strcmp(dir[i].name, "\0")==0) {
+				freent=i;
+				done=1;
+			}
+		}
+		if (strcmp(dir[i].name, name)==0) {
+			fprintf(stderr, "  filename already exists!\n");
+			return -EEXIST;
+		}
+	}
+
+	// expand parent if needed
+	if (!done) {
+		dir = expandarray(dir);
+
+		for (i=dirsize; i<(dirsize*2); i++) {
+			strncpy(dir[i].name, "\0", 255);
+		}
+		
+		freent = dirsize;
+	}
+
+	// update parent with file information
+	time_t now = time(NULL);
+
+	dir[freent].type = 'f';
+	strncpy(dir[freent].name, name, 255);
+	strcat(dir[freent].name, "\0");
+
+	dir[freent].mode = mode;
+	dir[freent].nlink = 1;
+	dir[freent].uid = 0;
+	dir[freent].gid = 0;
+	dir[freent].size = 0;
+	dir[freent].atime = now;
+	dir[freent].mtime = now;
+	dir[freent].ctime = now;
+
+	// store updated parent on s3
+    if (s3fs_remove_object(s3bucket, key) < 0) {
+        fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
+		return -EIO;
+    }	
+
+	dirsize = sizeof(dir);
+	rv = s3fs_put_object(s3bucket, key, (uint8_t*)&dir, dirsize);
+	if (rv < 0) {
+    	fprintf(stderr, "  failure to put new parent on s3\n");
+		return -EIO;
+    } else if (rv < dirsize) {
+       	fprintf(stderr, "  failed to upload full new parent (s3fs_put_object %ld)\n", rv);
+		return -EIO;
+    }
+
+	// finish up
+	free(dir);
+    return 0;
 }
 
 
@@ -567,7 +665,64 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
 int fs_open(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_open(path\"%s\")\n", path);
     s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+
+	if (path==NULL) {
+		fprintf(stderr, "  no path name provided; aborting\n");
+		return -ENOENT;
+	}
+
+	// break up path into key and basename
+	const char *key = dirname((char*)path);
+	const char *name = basename((char*)path);
+
+	if ( strcmp(key, ".")==0 ) {
+		fprintf(stderr, "  relative key name not supported by fs_getattr: %s\n", key);
+		return -EIO;
+	}	
+
+	// open parent directory
+	fprintf(stderr, "  retrieving parent directory from s3\n");
+	char *s3bucket = getenv(S3BUCKET);
+	s3dirent_t *dir;
+	ssize_t rv = s3fs_get_object(s3bucket, key, (uint8_t**)&dir, 0, 0);
+    if (rv < 0) {
+       	fprintf(stderr, "  cannot open parent directory: %s\n", key );
+		return -ENOENT;
+    } else if (rv != sizeof(dir)) {
+       	fprintf(stderr, "  failed to retrieve entire parent (s3fs_get_object %ld)\n", rv);
+		return -ENOENT;
+    } else {
+		fprintf(stderr, "  got parent from s3\n");
+	}
+
+	// locate file
+	fprintf(stderr, "  locating file in directory\n");
+	int dirsize = sizeof(dir)/sizeof(s3dirent_t);
+	int i=0;
+	for (; i<dirsize; i++) {
+		if (strcmp(dir[i].name, name)==0)
+			break;
+	}
+	
+	if (i>=dirsize) {
+		fprintf(stderr, "file not found\n");
+		return -ENOENT;
+	}
+
+	// check file type and permissions
+	if (dir[i].type != 'f') {
+		fprintf(stderr, "  entry is not a file; access denied\n");
+		return -EACCES;
+	}
+	if (dir[i].mode != (dir[i].mode|S_IRUSR)) {
+		fprintf(stderr, "  read by owner not permitted; access denied\n");
+		return -EACCES;
+	}
+
+	// finish up
+	fprintf(stderr, "  file exists and can be read\n");
+	free(dir);
+    return 0;
 }
 
 
@@ -656,7 +811,9 @@ int fs_truncate(const char *path, off_t newsize) {
 int fs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_ftruncate(path=\"%s\", offset=%d)\n", path, (int)offset);
     s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+
+	fs_truncate(path,0);
+    return 0;
 }
 
 
