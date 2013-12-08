@@ -41,7 +41,53 @@
 void *fs_init(struct fuse_conn_info *conn)
 {
     fprintf(stderr, "fs_init --- initializing file system.\n");
+
+	// clear bucket
+	fprintf(stderr, "  clearing bucket\n");
+	char *s3bucket = getenv(S3BUCKET);
+	s3fs_clear_bucket(s3bucket);
+	
+	// create root directory array
+	fprintf(stderr, "  creating root array\n");
+	s3dirent_t root[8];
+	
+	// set root directory entry
+	strcpy(&root[0].type, "d");
+	strncpy(root[0].name, ".", 256);
+
+	root[0].mode = (S_IFDIR | S_IRWXU | S_IRWXG | S_IRWXO); // directory, 777
+	root[0].nlink = 1;
+	root[0].uid = 0;
+	root[0].gid = 0;
+	root[0].size = sizeof(root);
+
+	time_t now = time(NULL);
+	root[0].atime = now;
+	root[0].mtime = now;
+	root[0].ctime = now;
+
+	// zero out remaining root object names
+	int i=1;
+	for (; i<8; i++) {
+		strcpy(&root[i].name, "\0");
+	}
+	
+	// store root object
+	fprintf(stderr, "  storing root array\n");
+	ssize_t size = sizeof(root);
+
+	ssize_t rv = s3fs_put_object(s3bucket, "/", (uint8_t*)&root, size);
+    if (rv < 0) {
+        fprintf(stderr, "  Failure in s3fs_put_object\n");
+    } else if (rv < size) {
+        fprintf(stderr, "  Failed to upload full root object (s3fs_put_object %ld)\n", rv);
+    } else {
+        fprintf(stderr, "  Successfully put root object in s3 (s3fs_put_object)\n");
+    }
+	
+	// finish up
     s3context_t *ctx = GET_PRIVATE_DATA;
+	fprintf(stderr, "  file system initialized\n");
     return ctx;
 }
 
@@ -61,9 +107,62 @@ void fs_destroy(void *userdata) {
  * and st_ino fields are ignored in the struct (and 
  * do not need to be filled in).
  */
-
 int fs_getattr(const char *path, struct stat *statbuf) {
     fprintf(stderr, "fs_getattr(path=\"%s\")\n", path);
+
+	if (path==NULL) return -ENOENT;
+
+	// break up path into key and basename
+	const char *key = dirname(path);
+	const char *name = basename(path);
+
+	if ( strcmp(key, ".")==0 ) {
+		fprintf(stderr, "  Relative key name not supported by fs_getattr: %s\n", key);
+		return -ENOENT;
+	}
+		
+	// retrieve array object
+	fprintf(stderr, "  retrieving object from s3\n");	
+	char *s3bucket = getenv(S3BUCKET);
+	s3dirent_t *dir;
+	ssize_t rv;
+
+	rv = s3fs_get_object(s3bucket, key, (uint8_t**)&dir, 0, 0);
+    if (rv < 0) {
+        fprintf(stderr, "  Failure in s3fs_get_object\n");
+		return -ENOENT;
+    } else if (rv < dir[0].size) {
+        fprintf(stderr, "  Failed to retrieve entire object (s3fs_get_object %ld)\n", rv);
+		return -ENOENT;
+    } else {
+        fprintf(stderr, "  Successfully retrieved object from s3 (s3fs_get_object)\n");
+    }
+
+	// does name exist in array?
+	int size = sizeof(dir)/sizeof(s3dirent_t);
+	int i=0;
+	for (; i<size; i++) {
+		
+
+	}
+
+	// set statbuf with metadata from retrieved object
+	/* skip st_dev */
+	/* skip st_ino */
+	statbuf->st_mode = dir[0].mode;
+	statbuf->st_nlink = dir[0].nlink;
+	statbuf->st_uid = dir[0].uid;
+	statbuf->st_gid = dir[0].gid;
+	statbuf->st_rdev = 0;
+	statbuf->st_size = dir[0].size;
+	/* skip st_blksize */
+	statbuf->st_blocks = (dir[0].size)/512;
+	statbuf->st_atime = dir[0].atime;
+	statbuf->st_mtime = dir[0].mtime;
+	statbuf->st_ctime = dir[0].ctime;
+
+	// finish up
+	free(dir);
     s3context_t *ctx = GET_PRIVATE_DATA;
     return -EIO;
 }
