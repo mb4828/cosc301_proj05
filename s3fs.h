@@ -34,7 +34,7 @@ typedef struct {
 	uid_t uid;					// user ID
 	gid_t gid;					// group ID
 	/* skip rdev */
-	ssize_t size;				// total size in bytes
+	off_t size;					// total size in bytes
 	/* skip blksize */
 	/* skip blocks */
 	time_t atime;				// time of last access
