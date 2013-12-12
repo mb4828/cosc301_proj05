@@ -58,8 +58,7 @@ void *fs_init(struct fuse_conn_info *conn)
 
 	// clear bucket
 	fprintf(stderr, "  clearing bucket\n");
-	char *s3bucket = getenv(S3BUCKET);
-	s3fs_clear_bucket(s3bucket);
+	s3fs_clear_bucket(ctx->s3bucket);
 	
 	// create root directory array
 	fprintf(stderr, "  creating root array\n");
@@ -90,7 +89,7 @@ void *fs_init(struct fuse_conn_info *conn)
 	fprintf(stderr, "  storing root array: %lu\n", sizeof(root)/sizeof(s3dirent_t));
 	ssize_t size = sizeof(root);
 
-	ssize_t rv = s3fs_put_object(s3bucket, "/", (uint8_t*)&root, size);
+	ssize_t rv = s3fs_put_object(ctx->s3bucket, "/", (uint8_t*)&root, size);
     if (rv < 0) {
         fprintf(stderr, "  failure in s3fs_put_object\n");
     } else if (rv < size) {
@@ -137,11 +136,10 @@ int fs_getattr(const char *path, struct stat *statbuf) {
 		
 	// retrieve array object
 	fprintf(stderr, "  retrieving object from s3\n");	
-	char *s3bucket = getenv(S3BUCKET);
 	s3dirent_t *dir;
 	int dirsize = 0;
 
-	ssize_t rv = s3fs_get_object(s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
         fprintf(stderr, "  key does not exist in s3: %s\n", dirkey);
 		return -ENOENT;
@@ -169,7 +167,7 @@ int fs_getattr(const char *path, struct stat *statbuf) {
 
 		// open directory containing the needed metadata
 		free(dir);
-		rv = s3fs_get_object(s3bucket, path, (uint8_t**)&dir, 0, 0);
+		rv = s3fs_get_object(ctx->s3bucket, path, (uint8_t**)&dir, 0, 0);
     	if (rv < 0) {
         	fprintf(stderr, "  directory does not exist in s3\n");
 			return -ENOENT;
@@ -219,13 +217,12 @@ int fs_opendir(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_opendir(path=\"%s\")\n", path);
     s3context_t *ctx = GET_PRIVATE_DATA;
 
-	char *s3bucket = getenv(S3BUCKET);
 	s3dirent_t *dir;
 	int dirsize = 0;
 
 	// retrieve array object
 	fprintf(stderr, "  retrieving object from s3\n");
-	ssize_t rv = s3fs_get_object(s3bucket, path, (uint8_t**)&dir, 0, 0);
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, path, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  object does not exist in s3 or is not a directory\n");
 		return -ENOENT;
@@ -248,13 +245,12 @@ int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
     fprintf(stderr, "fs_readdir(path=\"%s\", buf=%p, offset=%d)\n", path, buf, (int)offset);
 	s3context_t *ctx = GET_PRIVATE_DATA;
 
-	char *s3bucket = getenv(S3BUCKET);
 	s3dirent_t *dir;
 	int dirsize = 0;
 
 	// retrieve array object
 	fprintf(stderr, "  retrieving directory array from s3\n");
-	ssize_t rv = s3fs_get_object(s3bucket, path, (uint8_t**)&dir, 0, 0);
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, path, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  array retrieval failed\n");
 		return -ENOENT;
@@ -285,7 +281,7 @@ int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
  */
 int fs_releasedir(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_releasedir(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return 0;
 }
 
@@ -344,10 +340,9 @@ int fs_mkdir(const char *path, mode_t mode) {
 
 	// add new directory to s3
 	fprintf(stderr, "  adding new directory to s3\n");
-	char *s3bucket = getenv(S3BUCKET);
 
 	int size = sizeof(temp);
-	ssize_t rv = s3fs_put_object(s3bucket, path, (uint8_t*)&temp, size);
+	ssize_t rv = s3fs_put_object(ctx->s3bucket, path, (uint8_t*)&temp, size);
     if (rv < 0) {
         fprintf(stderr, "  failure to put new directory on s3\n");
 		return -EIO;
@@ -360,7 +355,7 @@ int fs_mkdir(const char *path, mode_t mode) {
 	s3dirent_t *dir;
 	int dirsize = 0;
 
-	rv = s3fs_get_object(s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+	rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  cannot open parent directory: %s\n", dirkey);
 		return -ENOENT;
@@ -386,13 +381,13 @@ int fs_mkdir(const char *path, mode_t mode) {
 
 	// replace parent directory on s3
 	fprintf(stderr, "  updating parent on s3\n");
-    if (s3fs_remove_object(s3bucket, dirkey) < 0) {
+    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
         fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
 		return -EIO;
     }
 
 	size = dirsize*sizeof(s3dirent_t);
-	rv = s3fs_put_object(s3bucket, dirkey, (uint8_t*)dir, size);
+	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new parent on s3\n");
 		return -EIO;
@@ -426,12 +421,11 @@ int fs_rmdir(const char *path) {
 	fprintf(stderr, "  path: %s\n", path);
 
 	// open directory to be removed
-	char *s3bucket = getenv(S3BUCKET);
 	s3dirent_t *dir;
 	int dirsize = 0;
 
 	fprintf(stderr, "  retrieving directory from s3\n");
-	ssize_t rv = s3fs_get_object(s3bucket, path, (uint8_t**)&dir, 0, 0);
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, path, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  array retrieval failed\n");
 		return -ENOENT;
@@ -454,7 +448,7 @@ int fs_rmdir(const char *path) {
 	// open parent directory
 	fprintf(stderr, "  updating parent directory\n");
 	free(dir);
-	rv = s3fs_get_object(s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+	rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  cannot open parent directory: %s\n", dirkey );
 		return -ENOENT;
@@ -474,13 +468,13 @@ int fs_rmdir(const char *path) {
 	}
 
 	// store updated parent on s3
-    if (s3fs_remove_object(s3bucket, dirkey) < 0) {
+    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
         fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
 		return -EIO;
     }	
 
 	int size = dirsize*sizeof(s3dirent_t);
-	rv = s3fs_put_object(s3bucket, dirkey, (uint8_t*)dir, size);
+	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new parent on s3\n");
 		return -EIO;
@@ -491,7 +485,7 @@ int fs_rmdir(const char *path) {
 
 	// remove directory from s3
 	fprintf(stderr, "  removing directory from s3\n");
-	if (s3fs_remove_object(s3bucket, path) < 0) {
+	if (s3fs_remove_object(ctx->s3bucket, path) < 0) {
         fprintf(stderr, "  failure to remove directory from s3 (s3fs_remove_object)\n");
 		return -EIO;
     }	
@@ -532,9 +526,8 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
 
 	// create empty file on s3
 	fprintf(stderr, "  creating empty file on s3\n");
-	char *s3bucket = getenv(S3BUCKET);
 
-	ssize_t rv = s3fs_put_object(s3bucket, path, NULL, 0);
+	ssize_t rv = s3fs_put_object(ctx->s3bucket, path, NULL, 0);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to create file on s3\n");
 		return -EIO;
@@ -545,7 +538,7 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
 	s3dirent_t *dir;
 	int dirsize = 0;
 
-	rv = s3fs_get_object(s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+	rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  cannot open parent directory: %s\n", dirkey );
 		return -ENOENT;
@@ -588,13 +581,13 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
 	dir[freent].ctime = now;
 
 	// store updated parent on s3
-    if (s3fs_remove_object(s3bucket, dirkey) < 0) {
+    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
         fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
 		return -EIO;
     }	
 
 	int size = dirsize*sizeof(s3dirent_t);
-	rv = s3fs_put_object(s3bucket, dirkey, (uint8_t*)dir, size);
+	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new parent on s3\n");
 		return -EIO;
@@ -638,11 +631,10 @@ int fs_open(const char *path, struct fuse_file_info *fi) {
 
 	// open parent directory
 	fprintf(stderr, "  retrieving parent directory from s3\n");
-	char *s3bucket = getenv(S3BUCKET);
 	s3dirent_t *dir;
 	int dirsize = 0;
 
-	ssize_t rv = s3fs_get_object(s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  cannot open parent directory: %s\n", dirkey );
 		return -ENOENT;
@@ -716,7 +708,7 @@ int fs_write(const char *path, const char *buf, size_t size, off_t offset, struc
  */
 int fs_release(const char *path, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_release(path=\"%s\")\n", path);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return 0;
 }
 
@@ -745,11 +737,10 @@ int fs_rename(const char *path, const char *newpath) {
 
 	// change file on s3 to new path but don't delete old one
 	fprintf(stderr, "  updating s3 with new filename\n");
-	char *s3bucket = getenv(S3BUCKET);
 	s3dirent_t *dir;
 	int dirsize = 0;
 
-	ssize_t rv = s3fs_get_object(s3bucket, path, (uint8_t**)&dir, 0, 0);
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, path, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  cannot open file: %s\n", name );
 		return -ENOENT;
@@ -758,7 +749,7 @@ int fs_rename(const char *path, const char *newpath) {
 	}
 
 	int size = dirsize*sizeof(s3dirent_t);
-	rv = s3fs_put_object(s3bucket, newpath, (uint8_t*)dir, size);
+	rv = s3fs_put_object(ctx->s3bucket, newpath, (uint8_t*)dir, size);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new file s3\n");
 		return -EIO;
@@ -770,7 +761,7 @@ int fs_rename(const char *path, const char *newpath) {
 	// open parent directory
 	fprintf(stderr, "  retrieving parent directory from s3\n");
 
-	rv = s3fs_get_object(s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+	rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  cannot open parent directory: %s\n", dirkey );
 		return -ENOENT;
@@ -795,13 +786,13 @@ int fs_rename(const char *path, const char *newpath) {
 	strcat(dir[i].name, "\0");
 
 	// store updated parent on s3
-    if (s3fs_remove_object(s3bucket, dirkey) < 0) {
+    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
         fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
 		return -EIO;
     }	
 
 	size = dirsize*sizeof(s3dirent_t);
-	rv = s3fs_put_object(s3bucket, dirkey, (uint8_t*)dir, size);
+	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new parent on s3\n");
 		return -EIO;
@@ -812,7 +803,7 @@ int fs_rename(const char *path, const char *newpath) {
 
 	// remove old file from s3	
 	fprintf(stderr, "  removing old file path from s3\n");
-	if (s3fs_remove_object(s3bucket, path) < 0) {
+	if (s3fs_remove_object(ctx->s3bucket, path) < 0) {
         fprintf(stderr, "  failure to remove old file from s3 (s3fs_remove_object)\n");
 		return -EIO;
     }
@@ -843,11 +834,10 @@ int fs_unlink(const char *path) {
 
 	// open parent directory
 	fprintf(stderr, "  retrieving parent directory from s3\n");
-	char *s3bucket = getenv(S3BUCKET);
 	s3dirent_t *dir;
 	int dirsize = 0;
 
-	ssize_t rv = s3fs_get_object(s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
     if (rv < 0) {
        	fprintf(stderr, "  cannot open parent directory: %s\n", dirkey );
 		return -ENOENT;
@@ -872,13 +862,13 @@ int fs_unlink(const char *path) {
 	dir[i].type='u';
 
 	// store updated parent on s3
-    if (s3fs_remove_object(s3bucket, dirkey) < 0) {
+    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
         fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
 		return -EIO;
     }	
 
 	int size = dirsize*sizeof(s3dirent_t);
-	rv = s3fs_put_object(s3bucket, dirkey, (uint8_t*)dir, size);
+	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new parent on s3\n");
 		return -EIO;
@@ -889,7 +879,7 @@ int fs_unlink(const char *path) {
 	
 	// remove file from s3
 	fprintf(stderr, "  removing file\n");
-	if (s3fs_remove_object(s3bucket, path) < 0) {
+	if (s3fs_remove_object(ctx->s3bucket, path) < 0) {
         fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
 		return -EIO;
     }	
@@ -928,7 +918,7 @@ int fs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) {
  */
 int fs_access(const char *path, int mask) {
     fprintf(stderr, "fs_access(path=\"%s\", mask=0%o)\n", path, mask);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
     return 0;
 }
 
