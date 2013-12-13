@@ -201,6 +201,8 @@ int fs_getattr(const char *path, struct stat *statbuf) {
 	statbuf->st_mtime = dir[i].mtime;
 	statbuf->st_ctime = dir[i].ctime;
 
+	// not bothering with updating ctime - sorry
+
 	// finish up
 	free(dir);
     return 0;
@@ -269,6 +271,8 @@ int fs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset
 			}
 		}
 	}
+
+	// not bothering with updating access time - sorry
 
 	// finish up
 	free(dir);
@@ -365,6 +369,10 @@ int fs_mkdir(const char *path, mode_t mode) {
 	}
 	
 	// update parent directory - don't store any metadata here
+	now = time(NULL);
+	dir[0].mtime = now;
+	dir[0].ctime = now;
+
 	i=1;
 	for (; i < dirsize; i++ ) {
 		if ( dir[i].type=='u' )
@@ -381,11 +389,6 @@ int fs_mkdir(const char *path, mode_t mode) {
 
 	// replace parent directory on s3
 	fprintf(stderr, "  updating parent on s3\n");
-    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
-        fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
-		return -EIO;
-    }
-
 	size = dirsize*sizeof(s3dirent_t);
 	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
@@ -456,6 +459,10 @@ int fs_rmdir(const char *path) {
 	dirsize = rv/sizeof(s3dirent_t);
 
 	// find entry in parent for directory to be removed and zero out
+	time_t now = time(NULL);
+	dir[0].mtime = now;
+	dir[0].ctime = now;
+
 	for (i=0; i<dirsize; i++) {
 		if (strcmp(dir[i].name, name)==0) {
 			dir[i].type='u';
@@ -468,17 +475,12 @@ int fs_rmdir(const char *path) {
 	}
 
 	// store updated parent on s3
-    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
-        fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
-		return -EIO;
-    }	
-
 	int size = dirsize*sizeof(s3dirent_t);
 	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new parent on s3\n");
 		return -EIO;
-    } else if (rv < dirsize) {
+    } else if (rv < size) {
        	fprintf(stderr, "  failed to upload full new parent (s3fs_put_object %ld)\n", rv);
 		return -EIO;
     }
@@ -549,10 +551,8 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
 
 	// locate free entry in parent directory
 	int i=0;
-	int freent=0;
 	for (; i<dirsize; i++) {		
 		if (dir[i].type=='u') {
-			freent=i;
 			break;
 		}
 	}
@@ -560,38 +560,34 @@ int fs_mknod(const char *path, mode_t mode, dev_t dev) {
 	// expand parent if needed
 	if (i>=dirsize) {
 		dir = expandarray(dir, dirsize);
-		freent = i;
 	}
 
 	// update parent with file information
 	fprintf(stderr, "  updating parent\n");
 	time_t now = time(NULL);
+	dir[0].mtime = now;
+	dir[0].ctime = now;
 
-	dir[freent].type = 'f';
-	strncpy(dir[freent].name, name, 255);
-	strcat(dir[freent].name, "\0");
+	dir[i].type = 'f';
+	strncpy(dir[i].name, name, 255);
+	strcat(dir[i].name, "\0");
 
-	dir[freent].mode = mode;
-	dir[freent].nlink = 1;
-	dir[freent].uid = 0;
-	dir[freent].gid = 0;
-	dir[freent].size = 0;
-	dir[freent].atime = now;
-	dir[freent].mtime = now;
-	dir[freent].ctime = now;
+	dir[i].mode = mode;
+	dir[i].nlink = 1;
+	dir[i].uid = 0;
+	dir[i].gid = 0;
+	dir[i].size = 0;
+	dir[i].atime = now;
+	dir[i].mtime = now;
+	dir[i].ctime = now;
 
 	// store updated parent on s3
-    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
-        fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
-		return -EIO;
-    }	
-
 	int size = dirsize*sizeof(s3dirent_t);
 	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new parent on s3\n");
 		return -EIO;
-    } else if (rv < dirsize) {
+    } else if (rv < size) {
        	fprintf(stderr, "  failed to upload full new parent (s3fs_put_object %ld)\n", rv);
 		return -EIO;
     }
@@ -655,8 +651,6 @@ int fs_open(const char *path, struct fuse_file_info *fi) {
 		return -ENOENT;
 	}
 
-	// not bothering with access times - deal with it
-
 	// finish up
 	fprintf(stderr, "  file exists\n");
 	free(dir);
@@ -675,7 +669,88 @@ int fs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
     fprintf(stderr, "fs_read(path=\"%s\", buf=%p, size=%d, offset=%d)\n",
           path, buf, (int)size, (int)offset);
     s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+
+	// break up path into key and basename - being super careful bc dirname/basename are so tricky
+	char path2[256]; char path3[256];
+	strncpy((char*)&path2, path, 255);
+	strncpy((char*)&path3, path, 255);
+	const char *dirkey = dirname(path2);
+	const char *name = basename(path3);
+
+	fprintf(stderr, "  key: %s\n", dirkey);
+	fprintf(stderr, "  name: %s\n", name);
+	fprintf(stderr, "  path: %s\n", path);
+
+	// get file metadata from s3 (we need to know the length)
+	fprintf(stderr, "  retrieving parent directory from s3\n");
+	s3dirent_t *dir;
+	int dirsize;
+
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+    if (rv < 0) {
+       	fprintf(stderr, "  cannot open parent directory: %s\n", dirkey );
+		return -ENOENT;
+    } else {
+		dirsize = rv/sizeof(s3dirent_t);
+	}
+
+	fprintf(stderr, "  locating file in directory\n");
+	int i=0;
+	for (; i<dirsize; i++) {
+		/*fprintf(stderr, "  looking at index %i; name %s\n", i, dir[i].name);*/
+		if (strcmp(dir[i].name, name)==0)
+			break;
+	}
+	if (i>=dirsize) {
+		fprintf(stderr, "file not found\n");
+		return -ENOENT;
+	}
+
+	int filesize = dir[i].size;
+	fprintf(stderr, "  file size is: %d bytes\n", filesize);
+
+	// get file from s3
+	fprintf(stderr, "  retrieving file from s3\n");
+	uint8_t *file;
+
+	rv = s3fs_get_object(ctx->s3bucket, path, &file, 0, 0);
+    if (rv < 0) {
+       	fprintf(stderr, "  cannot open file: %s\n", path );
+		return -ENOENT;
+    }
+	fprintf(stderr,"  filesize from s3 is: %ld\n",rv);
+
+	// read file into buffer
+	FILE *f = fmemopen(file, rv, "r");
+	if (f==NULL) {
+		fprintf(stderr, "  couldn't open file\n");
+		return -EIO;
+	}
+	fseek(f, offset, SEEK_SET);
+	size_t readcnt = fread(buf, 1, size, f);
+	fclose(f);
+
+	fprintf(stderr, "  read %lu bytes from file\n", readcnt);	
+
+	// update access time in parent
+	time_t now = time(NULL);
+	dir[i].atime = now;
+
+	// store parent on s3
+	int sz = dirsize*sizeof(s3dirent_t);
+	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, sz);
+	if (rv < 0) {
+    	fprintf(stderr, "  failure to put new parent on s3\n");
+		return -EIO;
+    } else if (rv < sz) {
+       	fprintf(stderr, "  failed to upload full new parent (s3fs_put_object %ld)\n", rv);
+		return -EIO;
+    }	
+
+	// finish up
+	free(dir);
+	free(file);
+	return readcnt;
 }
 
 
@@ -689,7 +764,109 @@ int fs_write(const char *path, const char *buf, size_t size, off_t offset, struc
     fprintf(stderr, "fs_write(path=\"%s\", buf=%p, size=%d, offset=%d)\n",
           path, buf, (int)size, (int)offset);
     s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+
+	// break up path into key and basename - being super careful bc dirname/basename are so tricky
+	char path2[256]; char path3[256];
+	strncpy((char*)&path2, path, 255);
+	strncpy((char*)&path3, path, 255);
+	const char *dirkey = dirname(path2);
+	const char *name = basename(path3);
+
+	fprintf(stderr, "  key: %s\n", dirkey);
+	fprintf(stderr, "  name: %s\n", name);
+	fprintf(stderr, "  path: %s\n", path);
+
+	// get parent from s3
+	fprintf(stderr, "  retrieving parent directory from s3\n");
+	s3dirent_t *dir;
+	int dirsize = 0;
+
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+    if (rv < 0) {
+       	fprintf(stderr, "  cannot open parent directory: %s\n", dirkey );
+		return -ENOENT;
+    } else {
+		dirsize = rv/sizeof(s3dirent_t);
+	}
+
+	fprintf(stderr, "  locating file in directory\n");
+	int i=0;
+	for (; i<dirsize; i++) {
+		/*fprintf(stderr, "  looking at index %i; name %s\n", i, dir[i].name);*/
+		if (strcmp(dir[i].name, name)==0)
+			break;
+	}
+	if (i>=dirsize) {
+		fprintf(stderr, "file not found\n");
+		return -ENOENT;
+	}
+
+	int filesize = dir[i].size;
+	fprintf(stderr, "  file size is: %d bytes\n", filesize);
+
+	// get file from s3
+	fprintf(stderr, "  retrieving file from s3\n");
+	char *file;
+
+	rv = s3fs_get_object(ctx->s3bucket, path, (uint8_t**)&file, 0, 0);
+    if (rv < 0) {
+       	fprintf(stderr, "  cannot open file: %s\n", path );
+		return -ENOENT;
+    }
+
+	// write to file from buffer
+	char *outbuf;
+	FILE *out = open_memstream(&outbuf, (size_t*)&filesize);
+	if (out==NULL) {
+		fprintf(stderr, "  couldn't create file buffer\n");
+		return -EIO;
+	}
+	fwrite(file, 1, offset, out);					// write the contents of file up to the offset
+	size_t written = fwrite(buf, 1, size, out);		// write the remaining bytes from buf
+	fclose(out);
+
+	free(file);
+	file = outbuf;									// file now points to contents of buffer
+
+	fprintf(stderr, "  wrote %lu bytes to file: %s\n", written, file);
+	fprintf(stderr, "  file size is now: %d\n", filesize);
+
+	// store file on s3
+	rv = s3fs_put_object(ctx->s3bucket, path, (uint8_t*)file, filesize);
+	if (rv < 0) {
+    	fprintf(stderr, "  failure to put file on s3\n");
+		return -EIO;
+    } else if (rv < filesize) {
+       	fprintf(stderr, "  failed to upload full file (s3fs_put_object %ld)\n", rv);
+		return -EIO;
+    }
+
+	// update metadata
+	time_t now = time(NULL);
+	dir[i].size = filesize;
+	dir[i].mtime = now;
+	dir[i].ctime = now;
+
+	// store parent on s3
+	if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
+        fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
+		return -EIO;
+    }
+
+	int sz = dirsize*sizeof(s3dirent_t);
+	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, sz);
+	if (rv < 0) {
+    	fprintf(stderr, "  failure to put new parent on s3\n");
+		return -EIO;
+    } else if (rv < sz) {
+       	fprintf(stderr, "  failed to upload full new parent (s3fs_put_object %ld)\n", rv);
+		return -EIO;
+    }
+
+	// finish up
+	free(dir);
+	free(file);
+    return written;
 }
 
 
@@ -721,17 +898,20 @@ int fs_rename(const char *path, const char *newpath) {
     s3context_t *ctx = GET_PRIVATE_DATA;
     
 	// break up path into key and basename - being super careful bc dirname/basename are so tricky
-	char path2[256]; char path3[256]; char path4[256];
+	char path2[256]; char path3[256]; char path4[256]; char path5[256];
 	strncpy((char*)&path2, path, 255);
 	strncpy((char*)&path3, path, 255);
 	strncpy((char*)&path4, newpath, 255);
+	strncpy((char*)&path5, newpath, 255);
 	const char *dirkey = dirname(path2);
 	const char *name = basename(path3);
-	const char *newname = basename(path4);
+	const char *newkey = dirname(path4);
+	const char *newname = basename(path5);
 
 	fprintf(stderr, "  key: %s\n", dirkey);
 	fprintf(stderr, "  name: %s\n", name);
 	fprintf(stderr, "  path: %s\n", path);
+	fprintf(stderr, "  new key: %s\n", newkey);
 	fprintf(stderr, "  new name: %s\n", newname);
 	fprintf(stderr, "  new path: %s\n", newpath);
 
@@ -753,12 +933,12 @@ int fs_rename(const char *path, const char *newpath) {
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new file s3\n");
 		return -EIO;
-    } else if (rv < dirsize) {
+    } else if (rv < size) {
        	fprintf(stderr, "  failed to upload full new file (s3fs_put_object %ld)\n", rv);
 		return -EIO;
     }
 
-	// open parent directory
+	// open old parent directory
 	fprintf(stderr, "  retrieving parent directory from s3\n");
 
 	rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
@@ -776,28 +956,93 @@ int fs_rename(const char *path, const char *newpath) {
 			break;
 	}
 	if (i>=dirsize) {
-		fprintf(stderr, "file not found\n");
+		fprintf(stderr, "  file not found\n");
 		return -ENOENT;
 	}
 
-	// update name in parent directory - not bothering w/ access times because not sure which to change
-	fprintf(stderr, "  updating parent directory\n");
-	strncpy(dir[i].name, newname, 255);
-	strcat(dir[i].name, "\0");
+	// is old parent same as new parent?
+	time_t now = time(NULL);
 
-	// store updated parent on s3
-    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
-        fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
-		return -EIO;
-    }	
+	if (strcmp(dirkey, newkey)==0) {
+		// old parent and new parent are the same
+		// update name in parent directory
+		fprintf(stderr, "  updating parent directory\n");
+		strncpy(dir[i].name, newname, 255);
+		strcat(dir[i].name, "\0");
 
+		dir[i].mtime = now;
+		dir[i].ctime = now;
+		dir[0].mtime = now;
+		dir[0].ctime = now;
+	} else {
+		// old parent and new parent are different
+		// remove name from old parent, load new parent, add name to new, and store
+		fprintf(stderr, "  moving file to new directory\n");
+
+		dir[i].type='u';		
+
+		s3dirent_t *dir2;
+		int dirsize2 = 0;	
+
+		rv = s3fs_get_object(ctx->s3bucket, newkey, (uint8_t**)&dir2, 0, 0);
+    	if (rv < 0) {
+       		fprintf(stderr, "  cannot open new parent directory: %s\n", newkey );
+			return -ENOENT;
+    	} else {
+			dirsize2 = rv/sizeof(s3dirent_t);
+		}			
+	
+		for (i=0; i<dirsize2; i++) {
+			if (dir2[i].type=='u')
+				break;
+		}
+		if (i>=dirsize2) {
+			dir2 = expandarray(dir2, dirsize2);	
+		}
+
+		now = time(NULL);
+		strncpy(dir2[i].name, newname, 255);
+		strcat(dir2[i].name, "\0");
+		dir2[i].type = 'f';
+
+		dir2[i].mode = dir[i].mode;
+		dir2[i].nlink = 1;
+		dir2[i].uid = 0;
+		dir2[i].gid = 0;
+		dir2[i].size = dir[i].size;
+		dir2[i].atime = now;
+		dir2[i].mtime = now;
+		dir2[i].ctime = now;
+
+		dir2[0].mtime = now;
+		dir2[0].ctime = now;
+
+		if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
+    	    fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
+			return -EIO;
+    	}
+
+		size = dirsize2*sizeof(s3dirent_t);
+		rv = s3fs_put_object(ctx->s3bucket, newkey, (uint8_t*)dir2, size);
+		if (rv < 0) {
+    		fprintf(stderr, "  failure to put new parent on s3\n");
+			return -EIO;
+    	} else if (rv < size) {
+      	 	fprintf(stderr, "  failed to upload full new parent (s3fs_put_object %ld)\n", rv);
+			return -EIO;
+    	}		
+
+		free(dir2);		
+	}
+
+	// store updated old parent on s3
 	size = dirsize*sizeof(s3dirent_t);
 	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
-    	fprintf(stderr, "  failure to put new parent on s3\n");
+    	fprintf(stderr, "  failure to put old parent on s3\n");
 		return -EIO;
-    } else if (rv < dirsize) {
-       	fprintf(stderr, "  failed to upload full new parent (s3fs_put_object %ld)\n", rv);
+    } else if (rv < size) {
+       	fprintf(stderr, "  failed to upload full old parent (s3fs_put_object %ld)\n", rv);
 		return -EIO;
     }
 
@@ -862,17 +1107,12 @@ int fs_unlink(const char *path) {
 	dir[i].type='u';
 
 	// store updated parent on s3
-    if (s3fs_remove_object(ctx->s3bucket, dirkey) < 0) {
-        fprintf(stderr, "  failure to remove old parent from s3 (s3fs_remove_object)\n");
-		return -EIO;
-    }	
-
 	int size = dirsize*sizeof(s3dirent_t);
 	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
 	if (rv < 0) {
     	fprintf(stderr, "  failure to put new parent on s3\n");
 		return -EIO;
-    } else if (rv < dirsize) {
+    } else if (rv < size) {
        	fprintf(stderr, "  failed to upload full new parent (s3fs_put_object %ld)\n", rv);
 		return -EIO;
     }
@@ -894,7 +1134,72 @@ int fs_unlink(const char *path) {
 int fs_truncate(const char *path, off_t newsize) {
     fprintf(stderr, "fs_truncate(path=\"%s\", newsize=%d)\n", path, (int)newsize);
     s3context_t *ctx = GET_PRIVATE_DATA;
-    return -EIO;
+
+	// break up path into key and basename - being super careful bc dirname/basename are so tricky
+	char path2[256]; char path3[256];
+	strncpy((char*)&path2, path, 255);
+	strncpy((char*)&path3, path, 255);
+	const char *dirkey = dirname(path2);
+	const char *name = basename(path3);
+
+	fprintf(stderr, "  key: %s\n", dirkey);
+	fprintf(stderr, "  name: %s\n", name);
+	fprintf(stderr, "  path: %s\n", path);
+
+	// open parent
+	fprintf(stderr, "  retrieving parent directory from s3\n");
+	s3dirent_t *dir;
+	int dirsize = 0;
+
+	ssize_t rv = s3fs_get_object(ctx->s3bucket, dirkey, (uint8_t**)&dir, 0, 0);
+    if (rv < 0) {
+       	fprintf(stderr, "  cannot open parent directory: %s\n", dirkey );
+		return -ENOENT;
+    } else {
+		dirsize = rv/sizeof(s3dirent_t);
+		fprintf(stderr, "  got parent from s3: %d\n",dirsize);
+	}
+
+	// locate file
+	fprintf(stderr, "  locating file in directory\n");
+	int i=0;
+	for (; i<dirsize; i++) {
+		if (strcmp(dir[i].name, name)==0)
+			break;
+	}
+	if (i>=dirsize) {
+		fprintf(stderr, "file not found\n");
+		return -ENOENT;
+	}
+
+	// change file length to zero
+	time_t now = time(NULL);
+
+	dir[i].size = 0;
+	dir[i].mtime = now;
+	dir[i].ctime = now;
+	dir[0].mtime = now;
+	dir[0].ctime = now;
+ 
+	// store parent
+	int size = dirsize*sizeof(s3dirent_t);
+	rv = s3fs_put_object(ctx->s3bucket, dirkey, (uint8_t*)dir, size);
+	if (rv < 0) {
+    	fprintf(stderr, "  failure to put new parent on s3\n");
+		return -EIO;
+    } else if (rv < size) {
+       	fprintf(stderr, "  failed to upload full new parent (s3fs_put_object %ld)\n", rv);
+		return -EIO;
+    }
+
+	// replace file on s3
+	rv = s3fs_put_object(ctx->s3bucket, path, NULL, 0);
+	if (rv < 0) {
+    	fprintf(stderr, "  failure to create file on s3\n");
+		return -EIO;
+    }
+
+	return 0;
 }
 
 
@@ -905,10 +1210,13 @@ int fs_truncate(const char *path, off_t newsize) {
  */
 int fs_ftruncate(const char *path, off_t offset, struct fuse_file_info *fi) {
     fprintf(stderr, "fs_ftruncate(path=\"%s\", offset=%d)\n", path, (int)offset);
-    s3context_t *ctx = GET_PRIVATE_DATA;
+    //s3context_t *ctx = GET_PRIVATE_DATA;
 
-	fs_truncate(path,0);
-    return 0;
+	if (fs_truncate(path,0)==0) {
+    	return 0;
+	} else {
+		return -EIO;
+	}
 }
 
 
